@@ -7,8 +7,14 @@ import paho.mqtt.client as mqtt
 import logging
 import json
 import os
+import threading
 from dotenv import load_dotenv
 load_dotenv()  # load .env into os.environ if present (standalone runs)
+
+try:
+    from flask import Flask, Response
+except ImportError:
+    Flask = None  # web UI simply disabled if flask isn't installed
 json_file_path = '/data/options.json'
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -40,6 +46,8 @@ else:
         "analyze_interval": float(os.environ.get("ANALYZE_INTERVAL", "0.4")),
         "enhance_contrast": os.environ.get("ENHANCE_CONTRAST", "false"),
         "motion_threshold": float(os.environ.get("MOTION_THRESHOLD", "3.0")),
+        "web_ui": os.environ.get("WEB_UI", "true"),
+        "web_port": int(os.environ.get("WEB_PORT", "8099")),
     })
 
 
@@ -93,6 +101,64 @@ ENHANCE_CONTRAST = str(data.get("enhance_contrast", False)).lower() in ("true", 
 # static - nobody moving on the couch. Value = mean abs frame difference (0..255)
 # on a tiny greyscale image. 0 disables the gate (always analyse).
 MOTION_THRESHOLD = float(data.get("motion_threshold", 3.0))
+
+# Web UI: serve an MJPEG preview of what the detector sees (ROI crop with hand
+# landmarks + gesture labels + status). With host_network the port is reachable
+# directly at http://<pi-ip>:WEB_PORT.
+WEB_UI = str(data.get("web_ui", True)).lower() in ("true", "1", "yes", "on")
+WEB_PORT = int(data.get("web_port", 8099))
+_web_lock = threading.Lock()
+_web_jpeg = None  # latest annotated JPEG bytes for the web UI
+
+
+def set_web_frame(frame_bgr, status_lines):
+    """Overlay status text, JPEG-encode, and stash for the web stream."""
+    global _web_jpeg
+    if not WEB_UI or Flask is None or frame_bgr is None:
+        return
+    disp = frame_bgr.copy()
+    y = 22
+    for line in status_lines:
+        # Black outline + green text so it's readable on any background.
+        cv2.putText(disp, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(disp, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+        y += 24
+    ok, buf = cv2.imencode(".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if ok:
+        with _web_lock:
+            _web_jpeg = buf.tobytes()
+
+
+def start_web_server():
+    """Start the MJPEG preview server in a daemon thread."""
+    if not WEB_UI or Flask is None:
+        logger.info("Web UI disabled (web_ui=%s, flask=%s)", WEB_UI, Flask is not None)
+        return
+    app = Flask(__name__)
+
+    @app.route("/")
+    def _index():
+        # Relative img src so it also works behind a reverse proxy.
+        return ('<!doctype html><title>Gesture detector</title>'
+                '<body style="margin:0;background:#111;text-align:center">'
+                '<img src="stream" style="max-width:100%;height:auto"></body>')
+
+    @app.route("/stream")
+    def _stream():
+        def gen():
+            while True:
+                with _web_lock:
+                    frame = _web_jpeg
+                if frame is not None:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                time.sleep(0.1)
+        return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=WEB_PORT, threaded=True),
+        daemon=True,
+    ).start()
+    logger.info("Web UI on http://<host>:%d", WEB_PORT)
 
 # When False, the loop skips all heavy recognition work (palm detect + landmarks
 # + classify) but keeps the RTSP stream and MQTT connection alive. Defaults True
@@ -278,11 +344,14 @@ def run(model: str, num_hands: int,
 
     # Motion gate: on a static scene, skip the whole MediaPipe pipeline. Cheap
     # mean-abs-diff on a tiny greyscale frame; a hand moving easily clears it.
+    motion = 0.0
     if MOTION_THRESHOLD > 0:
         gray = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (160, 90))
         motion = 999.0 if prev_gray is None else float(cv2.absdiff(gray, prev_gray).mean())
         prev_gray = gray
         if motion < MOTION_THRESHOLD:
+            set_web_frame(image, ["IDLE - no motion (%.1f < %.1f)" % (motion, MOTION_THRESHOLD),
+                                  "ROI x %.2f-%.2f  y %.2f-%.2f" % (ROI_LEFT, ROI_RIGHT, ROI_TOP, ROI_BOTTOM)])
             continue
 
     # Optional contrast boost: apply CLAHE on the L (lightness) channel to pull
@@ -396,8 +465,12 @@ def run(model: str, num_hands: int,
       recognition_frame = current_frame
       recognition_result_list.clear()
 
-    #if recognition_frame is not None:
-       # cv2.imshow('gesture_recognition', recognition_frame)
+    # Push the annotated frame (ROI crop + landmarks + gesture text) to the web
+    # preview, with a status line for tuning ROI / thresholds.
+    set_web_frame(current_frame, [
+        "FPS %.1f  motion %.1f  diag %s" % (FPS, motion, _LAST_DIAG or "-"),
+        "ROI x %.2f-%.2f  y %.2f-%.2f" % (ROI_LEFT, ROI_RIGHT, ROI_TOP, ROI_BOTTOM),
+    ])
 
     key = cv2.waitKey(1) & 0xFF
     if key == 27:
@@ -456,6 +529,9 @@ def main():
       required=False,
       default=480)
   args = parser.parse_args()
+
+  # Start the MJPEG preview server (no-op if disabled / flask missing).
+  start_web_server()
 
   # Config options win over argparse defaults so HA users can tune sensitivity.
   num_hands = int(data.get("num_hands", args.numHands))
