@@ -38,6 +38,7 @@ else:
         "min_tracking_confidence": float(os.environ.get("MIN_TRACKING_CONFIDENCE", "0.5")),
         "min_gesture_score": float(os.environ.get("MIN_GESTURE_SCORE", "0.5")),
         "analyze_interval": float(os.environ.get("ANALYZE_INTERVAL", "0.4")),
+        "enhance_contrast": os.environ.get("ENHANCE_CONTRAST", "false"),
     })
 
 
@@ -81,6 +82,11 @@ ROI_ENABLED = (ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT) != (0.0, 1.0, 0.0, 1.0)
 # Minimum gesture-classification score to publish. Lower = more sensitive
 # (fires on weaker gestures, but more false positives).
 MIN_GESTURE_SCORE = float(data.get("min_gesture_score", 0.5))
+
+# Optional CLAHE contrast boost. Helps backlit / uneven-light scenes (e.g. a
+# bright window on one side) where a hand in shadow has too little contrast for
+# the palm detector. Costs a little CPU per analysed frame.
+ENHANCE_CONTRAST = str(data.get("enhance_contrast", False)).lower() in ("true", "1", "yes", "on")
 
 # When False, the loop skips all heavy recognition work (palm detect + landmarks
 # + classify) but keeps the RTSP stream and MQTT connection alive. Defaults True
@@ -232,6 +238,7 @@ def run(model: str, num_hands: int,
   hand_time = {}
 
   # Continuously capture images from the camera and run inference
+  clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if ENHANCE_CONTRAST else None
   last_analysis = 0.0  # wall-clock time of the last analysed frame
   while cap.isOpened():
     # HA toggled recognition off -> skip decode + heavy work, keep stream alive.
@@ -261,6 +268,14 @@ def run(model: str, num_hands: int,
         h, w = image.shape[:2]
         image = image[int(ROI_TOP * h):int(ROI_BOTTOM * h),
                       int(ROI_LEFT * w):int(ROI_RIGHT * w)]
+
+    # Optional contrast boost: apply CLAHE on the L (lightness) channel to pull
+    # detail out of backlit/shadowed regions without wrecking colour.
+    if clahe is not None:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = clahe.apply(l)
+        image = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
     # Feed the frame straight from memory (no lossy frame.jpg round-trip).
     rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
