@@ -48,6 +48,7 @@ else:
         "motion_threshold": float(os.environ.get("MOTION_THRESHOLD", "3.0")),
         "web_ui": os.environ.get("WEB_UI", "true"),
         "web_port": int(os.environ.get("WEB_PORT", "8099")),
+        "zones": int(os.environ.get("ZONES", "1")),
     })
 
 
@@ -107,6 +108,12 @@ MOTION_THRESHOLD = float(data.get("motion_threshold", 3.0))
 # directly at http://<pi-ip>:WEB_PORT.
 WEB_UI = str(data.get("web_ui", True)).lower() in ("true", "1", "yes", "on")
 WEB_PORT = int(data.get("web_port", 8099))
+
+# Split the ROI into this many vertical columns, each detected separately. A
+# near-square zone lets MediaPipe's letterbox shrink the hand less -> better
+# detection of small/distant hands. Zones also map to people sitting side by
+# side (zone 0 = leftmost); each zone publishes to its own MQTT topic.
+ZONES = max(1, int(data.get("zones", 1)))
 _web_lock = threading.Lock()
 _web_jpeg = None  # latest annotated JPEG bytes for the web UI
 
@@ -215,7 +222,7 @@ def run(model: str, num_hands: int,
         min_hand_detection_confidence: float,
         min_hand_presence_confidence: float, min_tracking_confidence: float,
         camera_id: int, width: int, height: int) -> None:
-  global FRAME_COUNT, mqtt_last_restart_time # Declare FRAME_COUNT as a global variable
+  global FRAME_COUNT, mqtt_last_restart_time, _LAST_DIAG, FPS
   """Continuously run inference on images acquired from the camera.
 
   Args:
@@ -256,50 +263,16 @@ def run(model: str, num_hands: int,
   label_font_size = 1
   label_thickness = 2
 
-  recognition_frame = None
-  recognition_result_list = []
-  
-
-  def save_result(result: vision.GestureRecognizerResult,
-                  unused_output_image: mp.Image, timestamp_ms: int):
-      global FPS, COUNTER, START_TIME, _LAST_DIAG
-
-      # Calculate the FPS
-      if COUNTER % fps_avg_frame_count == 0:
-          FPS = fps_avg_frame_count / (time.time() - START_TIME)
-          START_TIME = time.time()
-
-      # Diagnostic: tells you WHERE the pipeline fails. Logged only on state
-      # change so it doesn't spam every sampled frame.
-      #   no landmarks  -> palm detector/landmark stage (camera/framing/light)
-      #   landmarks but no gesture -> classifier problem (retraining would help)
-      if not result.hand_landmarks:
-          diag = "no_hand"
-      elif not result.gestures:
-          diag = "no_gesture"
-      else:
-          diag = "ok"
-      if diag != _LAST_DIAG:
-          if diag == "no_hand":
-              logger.info("diag: no hand detected in frame")
-          elif diag == "no_gesture":
-              logger.info("diag: hand detected but no gesture classified")
-          else:
-              logger.info("diag: hand + gesture ok")
-          _LAST_DIAG = diag
-
-      recognition_result_list.append(result)
-      COUNTER += 1
-
-  # Initialize the gesture recognizer model
+  # IMAGE mode: synchronous recognize() returns the result directly, so we can
+  # run detection on several zone crops per cycle and know which zone each hit
+  # belongs to (LIVE_STREAM's async callback can't tell them apart).
   base_options = python.BaseOptions(model_asset_path=model)
   options = vision.GestureRecognizerOptions(base_options=base_options,
-                                          running_mode=vision.RunningMode.LIVE_STREAM,
+                                          running_mode=vision.RunningMode.IMAGE,
                                           num_hands=num_hands,
                                           min_hand_detection_confidence=min_hand_detection_confidence,
                                           min_hand_presence_confidence=min_hand_presence_confidence,
-                                          min_tracking_confidence=min_tracking_confidence,
-                                          result_callback=save_result)
+                                          min_tracking_confidence=min_tracking_confidence)
   recognizer = vision.GestureRecognizer.create_from_options(options)
 
     
@@ -312,6 +285,7 @@ def run(model: str, num_hands: int,
   # Continuously capture images from the camera and run inference
   clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if ENHANCE_CONTRAST else None
   last_analysis = 0.0  # wall-clock time of the last analysed frame
+  prev_cycle_t = 0.0   # for the analyse-rate FPS shown in the preview
   prev_gray = None     # previous tiny greyscale frame, for the motion gate
   while cap.isOpened():
     # HA toggled recognition off -> skip decode + heavy work, keep stream alive.
@@ -362,113 +336,85 @@ def run(model: str, num_hands: int,
         l = clahe.apply(l)
         image = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
-    # Feed the frame straight from memory (no lossy frame.jpg round-trip).
-    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-    recognizer.recognize_async(mp_image, time.time_ns() // 1_000_000)
+    # Split the ROI into ZONES vertical columns and detect in each. A narrower,
+    # near-square column lets MediaPipe's letterbox shrink the hand less -> small
+    # / distant hands detect better than in one wide strip. zone 0 = leftmost.
+    roi_h, roi_w = image.shape[:2]
+    display = image.copy()
+    zone_w = max(1, roi_w // ZONES)
+    reset_after = int(data.get("reset_hand_status_time"))
+    ts = time.time()
+    any_hand = any_gesture = False
 
+    for z in range(ZONES):
+        zx0 = z * zone_w
+        zx1 = roi_w if z == ZONES - 1 else (z + 1) * zone_w
+        zw = zx1 - zx0
+        zone_img = image[:, zx0:zx1]
 
-    # Show the FPS
-    fps_text = 'FPS = {:.1f}'.format(FPS)
-    text_location = (left_margin, row_size)
-    current_frame = image
-    cv2.putText(current_frame, fps_text, text_location, cv2.FONT_HERSHEY_DUPLEX,
-                font_size, text_color, font_thickness, cv2.LINE_AA)
+        if ZONES > 1:  # draw the zone boundary on the preview
+            cv2.rectangle(display, (zx0, 0), (zx1 - 1, roi_h - 1), (255, 255, 0), 1)
 
-    if recognition_result_list:
-      #print(recognition_result_list)
-      # Draw landmarks and write the text for each hand.
-      for hand_index, hand_landmarks in enumerate(
-          recognition_result_list[0].hand_landmarks):
-        # Calculate the bounding box of the hand
-        x_min = min([landmark.x for landmark in hand_landmarks])
-        y_min = min([landmark.y for landmark in hand_landmarks])
-        y_max = max([landmark.y for landmark in hand_landmarks])
-
-        # Convert normalized coordinates to pixel values
-        frame_height, frame_width = current_frame.shape[:2]
-        x_min_px = int(x_min * frame_width)
-        y_min_px = int(y_min * frame_height)
-        y_max_px = int(y_max * frame_height)
-
-        #Get hand 
-        if recognition_result_list[0].handedness:
-           handedness_info = recognition_result_list[0].handedness[0]
-           handedness_value = handedness_info[0].display_name
-           #print(handedness_value)
-
-        # Get gesture classification results
-        if recognition_result_list[0].gestures:
-          
-          gesture = recognition_result_list[0].gestures[hand_index]
-          category_name = gesture[0].category_name
-          score = round(gesture[0].score, 2)
-          result_text = f'{category_name} ({score})'
-        
-        
-
-          # Compute text size
-          text_size = \
-          cv2.getTextSize(result_text, cv2.FONT_HERSHEY_DUPLEX, label_font_size,
-                          label_thickness)[0]
-          text_width, text_height = text_size
-
-          # Calculate text position (above the hand)
-          text_x = x_min_px
-          text_y = y_min_px - 10  # Adjust this value as needed
-
-          # Make sure the text is within the frame boundaries
-          if text_y < 0:
-            text_y = y_max_px + text_height
-
-          # Draw the text
-          cv2.putText(current_frame, result_text, (text_x, text_y),
-                      cv2.FONT_HERSHEY_DUPLEX, label_font_size,
-                      label_text_color, label_thickness, cv2.LINE_AA)
-          
-          #print(result_text, (text_x, text_y))
-        hand_status = category_name
-
-        # Option A: every detected hand publishes to one topic. Skip the
-        # "None"/no-gesture class so idle hands don't spam MQTT.
-        if hand_status in ("None", ""):
+        rgb = cv2.cvtColor(zone_img, cv2.COLOR_BGR2RGB)
+        result = recognizer.recognize(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+        if not result.hand_landmarks:
             continue
+        any_hand = True
 
-        # Per-hand dedup (keyed by hand_index). Reset this hand's memory after
-        # reset_hand_status_time seconds so the same gesture can fire again.
-        reset_after = int(data.get("reset_hand_status_time"))
-        if hand_index in hand_time and \
-           (time.time() - hand_time[hand_index]) >= reset_after:
-              prev_handedness_value.pop(hand_index, None)
+        for hand_index, hand_landmarks in enumerate(result.hand_landmarks):
+            # Landmarks are normalized to the zone; remap x into the full ROI so
+            # the skeleton draws in the right place on the preview.
+            proto = landmark_pb2.NormalizedLandmarkList()
+            proto.landmark.extend([
+                landmark_pb2.NormalizedLandmark(
+                    x=(zx0 + lm.x * zw) / roi_w, y=lm.y, z=lm.z)
+                for lm in hand_landmarks])
+            mp_drawing.draw_landmarks(
+                display, proto, mp_hands.HAND_CONNECTIONS,
+                mp_drawing_styles.get_default_hand_landmarks_style(),
+                mp_drawing_styles.get_default_hand_connections_style())
 
-        # Publish only on change for this hand, above confidence threshold.
-        if hand_status != prev_handedness_value.get(hand_index) and score > MIN_GESTURE_SCORE:
-              client.publish(mqtt_topic, hand_status)
-              logger.info("hand %d: %s (%.2f)", hand_index, hand_status, score)
-              prev_handedness_value[hand_index] = hand_status
-              hand_time[hand_index] = time.time()
-              
-        # Draw hand landmarks on the frame
-        hand_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
-        hand_landmarks_proto.landmark.extend([
-          landmark_pb2.NormalizedLandmark(x=landmark.x, y=landmark.y,
-                                          z=landmark.z) for landmark in
-          hand_landmarks
-        ])
-        mp_drawing.draw_landmarks(
-          current_frame,
-          hand_landmarks_proto,
-          mp_hands.HAND_CONNECTIONS,
-          mp_drawing_styles.get_default_hand_landmarks_style(),
-          mp_drawing_styles.get_default_hand_connections_style())
+            if not result.gestures or hand_index >= len(result.gestures):
+                continue
+            category_name = result.gestures[hand_index][0].category_name
+            score = round(result.gestures[hand_index][0].score, 2)
+            any_gesture = True
 
-      recognition_frame = current_frame
-      recognition_result_list.clear()
+            # Gesture label above the hand on the preview.
+            lx = int(zx0 + min(lm.x for lm in hand_landmarks) * zw)
+            ly = max(18, int(min(lm.y for lm in hand_landmarks) * roi_h) - 8)
+            cv2.putText(display, "%s (%.2f)" % (category_name, score), (lx, ly),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-    # Push the annotated frame (ROI crop + landmarks + gesture text) to the web
-    # preview, with a status line for tuning ROI / thresholds.
-    set_web_frame(current_frame, [
-        "FPS %.1f  motion %.1f  diag %s" % (FPS, motion, _LAST_DIAG or "-"),
+            # Skip the "None"/no-gesture class.
+            if category_name in ("None", ""):
+                continue
+
+            # Zones are only a detection trick - everything still goes to the
+            # single mqtt_topic. Dedup keyed per (zone, hand) so zones don't
+            # clobber each other's state.
+            key = (z, hand_index)
+            if key in hand_time and (ts - hand_time[key]) >= reset_after:
+                prev_handedness_value.pop(key, None)
+            if category_name != prev_handedness_value.get(key) and score > MIN_GESTURE_SCORE:
+                client.publish(mqtt_topic, category_name)
+                logger.info("zone %d hand %d: %s (%.2f)",
+                            z, hand_index, category_name, score)
+                prev_handedness_value[key] = category_name
+                hand_time[key] = ts
+
+    # Analyse-rate FPS for the status overlay.
+    FPS = 1.0 / max(1e-3, ts - prev_cycle_t)
+    prev_cycle_t = ts
+
+    # Diagnostic (logged only on state change).
+    diag = "ok" if any_gesture else ("no_gesture" if any_hand else "no_hand")
+    if diag != _LAST_DIAG:
+        logger.info("diag: %s", diag)
+        _LAST_DIAG = diag
+
+    set_web_frame(display, [
+        "FPS %.1f  motion %.1f  diag %s  zones %d" % (FPS, motion, diag, ZONES),
         "ROI x %.2f-%.2f  y %.2f-%.2f" % (ROI_LEFT, ROI_RIGHT, ROI_TOP, ROI_BOTTOM),
     ])
 

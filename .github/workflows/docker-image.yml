@@ -27,6 +27,6 @@ jobs:
       - name: Build and push arm64 image
         run: |
           IMG=ghcr.io/razormeister/handgesturerecognition
-          docker build -t $IMG:1.3.0 -t $IMG:latest .
-          docker push $IMG:1.3.0
+          docker build -t $IMG:1.4.0 -t $IMG:latest .
+          docker push $IMG:1.4.0
           docker push $IMG:latest
