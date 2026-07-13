@@ -212,6 +212,50 @@ FRAME_COUNT = 0  # Counter for saving images
 ANALYZE_INTERVAL = float(data.get("analyze_interval", 0.4))  # seconds between analyses (lower = faster reaction, more CPU)
 _LAST_DIAG = None  # last diagnostic state, so we log only on change (no spam)
 
+
+class FrameGrabber:
+    """Background RTSP reader that always keeps only the NEWEST frame. The
+    analysis loop reads from here, so it never falls behind a growing decode
+    buffer (the cause of creeping latency). Reconnects if the stream drops."""
+
+    def __init__(self, url):
+        self.url = url
+        self.lock = threading.Lock()
+        self.frame = None
+        self.running = True
+        self.cap = cv2.VideoCapture(url)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        fails = 0
+        while self.running:
+            ok, f = self.cap.read() if self.cap is not None else (False, None)
+            if ok:
+                fails = 0
+                with self.lock:
+                    self.frame = f
+            else:
+                fails += 1
+                logger.info("RTSP read failed (%d) - reconnecting", fails)
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                time.sleep(1.0)
+                self.cap = cv2.VideoCapture(self.url)
+
+    def read(self):
+        with self.lock:
+            return None if self.frame is None else self.frame.copy()
+
+    def release(self):
+        self.running = False
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
+
 def run(model: str, num_hands: int,
         min_hand_detection_confidence: float,
         min_hand_presence_confidence: float, min_tracking_confidence: float,
@@ -233,10 +277,8 @@ def run(model: str, num_hands: int,
       height: The height of the frame captured from the camera.
   """
 
-  # Start capturing video input from the camera
-  #cap = cv2.VideoCapture(camera_id)
-
-  cap = cv2.VideoCapture(data.get("rtsp_url"))
+  # Background reader keeps only the newest frame -> no latency drift.
+  grabber = FrameGrabber(data.get("rtsp_url"))
  # cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
  # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
  # cv2.namedWindow('gesture_recognition', cv2.WINDOW_NORMAL)
@@ -280,27 +322,24 @@ def run(model: str, num_hands: int,
   clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if ENHANCE_CONTRAST else None
   last_analysis = 0.0  # wall-clock time of the last analysed frame
   prev_cycle_t = 0.0   # for the analyse-rate FPS shown in the preview
-  while cap.isOpened():
-    # HA toggled recognition off -> skip decode + heavy work, keep stream alive.
+  while True:
+    # HA toggled recognition off -> idle (the grabber keeps draining the stream).
     if not analysis_enabled:
-        cap.grab()          # advance stream without decoding
-        time.sleep(0.05)    # ease CPU while idle
+        time.sleep(0.05)
         continue
 
-    # Time-based sampling: analyse at most once per ANALYZE_INTERVAL seconds,
-    # independent of camera fps. grab() advances the RTSP stream cheaply
-    # (no H264 decode) between analysed frames -> big CPU saving.
+    # Analyse at most once per ANALYZE_INTERVAL seconds. The grabber always has
+    # the newest frame, so we never process stale/buffered frames.
     now = time.time()
     if now - last_analysis < ANALYZE_INTERVAL:
-        cap.grab()
+        time.sleep(0.01)
         continue
     last_analysis = now
 
-    success, image = cap.read()   # grab + decode the frame we analyse
-    if not success:
-      sys.exit(
-          'ERROR: Unable to read from webcam. Please verify your webcam settings.'
-      )
+    image = grabber.read()
+    if image is None:   # stream not up yet / reconnecting
+        time.sleep(0.05)
+        continue
 
     # Optional ROI crop: hand only appears in part of the frame. Cropping makes
     # the hand larger after MediaPipe's internal resize -> better detection.
@@ -399,13 +438,8 @@ def run(model: str, num_hands: int,
         "ROI x %.2f-%.2f  y %.2f-%.2f" % (ROI_LEFT, ROI_RIGHT, ROI_TOP, ROI_BOTTOM),
     ])
 
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27:
-        break
-
   recognizer.close()
-  cap.release()
-  cv2.destroyAllWindows()
+  grabber.release()
 
 
 def main():
