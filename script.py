@@ -28,6 +28,10 @@ else:
         "mqtt_topic": os.environ.get("MQTT_TOPIC", "hand_gesture_status"),
         "mqtt_enable_topic": os.environ.get("MQTT_ENABLE_TOPIC", "hand_gesture_enable"),
         "reset_hand_status_time": int(os.environ.get("RESET_HAND_STATUS_TIME", "10")),
+        "roi_top": float(os.environ.get("ROI_TOP", "0.0")),
+        "roi_bottom": float(os.environ.get("ROI_BOTTOM", "1.0")),
+        "roi_left": float(os.environ.get("ROI_LEFT", "0.0")),
+        "roi_right": float(os.environ.get("ROI_RIGHT", "1.0")),
     })
 
 
@@ -58,6 +62,15 @@ mqtt_username = data.get("mqtt_username")
 mqtt_password = data.get("mqtt_password")
 # Topic HA publishes ON/OFF to, mirroring input_boolean.cfg_camera_gesture_recognition.
 mqtt_enable_topic = data.get("mqtt_enable_topic", "hand_gesture_enable")
+
+# Optional region-of-interest crop, as fractions of the frame (0..1). Restrict
+# where a hand is searched for -> hand is larger after MediaPipe's internal
+# resize -> better detection. Default = full frame (no crop).
+ROI_TOP = float(data.get("roi_top", 0.0))
+ROI_BOTTOM = float(data.get("roi_bottom", 1.0))
+ROI_LEFT = float(data.get("roi_left", 0.0))
+ROI_RIGHT = float(data.get("roi_right", 1.0))
+ROI_ENABLED = (ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT) != (0.0, 1.0, 0.0, 1.0)
 
 # When False, the loop skips all heavy recognition work (palm detect + landmarks
 # + classify) but keeps the RTSP stream and MQTT connection alive. Defaults True
@@ -195,29 +208,38 @@ def run(model: str, num_hands: int,
 
   # Continuously capture images from the camera and run inference
   while cap.isOpened():
-    success, image = cap.read()
+    # HA toggled recognition off -> skip decode + heavy work, keep stream alive.
+    if not analysis_enabled:
+        cap.grab()          # advance stream without decoding
+        time.sleep(0.05)    # ease CPU while idle
+        continue
+
+    FRAME_COUNT += 1
+
+    # Only decode + analyse every SAMPLE_EVERY-th frame. grab() advances the
+    # RTSP stream cheaply (no H264 decode); we retrieve/decode ONLY the frames
+    # we actually use -> big CPU saving vs decoding all 25 fps.
+    if FRAME_COUNT % SAMPLE_EVERY != 0:
+        cap.grab()
+        continue
+
+    success, image = cap.read()   # grab + decode the sampled frame
     if not success:
       sys.exit(
           'ERROR: Unable to read from webcam. Please verify your webcam settings.'
       )
 
-            # Increment the frame count
-    FRAME_COUNT += 1
+    # Optional ROI crop: hand only appears in part of the frame. Cropping makes
+    # the hand larger after MediaPipe's internal resize -> better detection.
+    if ROI_ENABLED:
+        h, w = image.shape[:2]
+        image = image[int(ROI_TOP * h):int(ROI_BOTTOM * h),
+                      int(ROI_LEFT * w):int(ROI_RIGHT * w)]
 
-    # HA toggled recognition off -> skip heavy work, keep stream + MQTT alive.
-    if not analysis_enabled:
-        time.sleep(0.05)  # ease CPU while idle
-        continue
-
-        # Run recognition every SAMPLE_EVERY frames.
-    if FRAME_COUNT % SAMPLE_EVERY == 0:
-            # Feed the frame straight from memory. The old code wrote it to
-            # frame.jpg and read it back -> JPEG compression + disk I/O = worse
-            # detection and slower. No round-trip now.
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-
-            recognizer.recognize_async(mp_image, time.time_ns() // 1_000_000)
+    # Feed the frame straight from memory (no lossy frame.jpg round-trip).
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+    recognizer.recognize_async(mp_image, time.time_ns() // 1_000_000)
 
 
     # Show the FPS
