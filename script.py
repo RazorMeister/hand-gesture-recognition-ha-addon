@@ -6,12 +6,28 @@ import mediapipe as mp
 import paho.mqtt.client as mqtt
 import logging
 import json
+import os
+from dotenv import load_dotenv
+load_dotenv()  # load .env into os.environ if present (standalone runs)
 json_file_path = '/data/options.json'
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from mediapipe.framework.formats import landmark_pb2
-with open(json_file_path, 'r') as file:
-    json_data = file.read()
+if os.path.exists(json_file_path):
+    with open(json_file_path, 'r') as file:
+        json_data = file.read()
+else:
+    # /data/options.json only exists when run as an HA addon via Supervisor.
+    # Fall back to environment variables for standalone/docker runs.
+    json_data = json.dumps({
+        "rtsp_url": os.environ.get("RTSP_URL", ""),
+        "mqtt_host": os.environ.get("MQTT_HOST", ""),
+        "mqtt_port": int(os.environ.get("MQTT_PORT", "1883")),
+        "mqtt_username": os.environ.get("MQTT_USERNAME", ""),
+        "mqtt_password": os.environ.get("MQTT_PASSWORD", ""),
+        "mqtt_topic": os.environ.get("MQTT_TOPIC", "hand_gesture_status"),
+        "reset_hand_status_time": int(os.environ.get("RESET_HAND_STATUS_TIME", "10")),
+    })
 
 
 logger = logging.getLogger(__name__)
