@@ -122,6 +122,7 @@ COUNTER, FPS = 0, 0
 START_TIME = time.time()
 FRAME_COUNT = 0  # Counter for saving images
 SAMPLE_EVERY = 10  # run recognition every Nth frame (lower = more responsive, more CPU)
+_LAST_DIAG = None  # last diagnostic state, so we log only on change (no spam)
 
 def run(model: str, num_hands: int,
         min_hand_detection_confidence: float,
@@ -174,20 +175,31 @@ def run(model: str, num_hands: int,
 
   def save_result(result: vision.GestureRecognizerResult,
                   unused_output_image: mp.Image, timestamp_ms: int):
-      global FPS, COUNTER, START_TIME
+      global FPS, COUNTER, START_TIME, _LAST_DIAG
 
       # Calculate the FPS
       if COUNTER % fps_avg_frame_count == 0:
           FPS = fps_avg_frame_count / (time.time() - START_TIME)
           START_TIME = time.time()
 
-      # Diagnostic: tells you WHERE the pipeline fails.
-      #   no landmarks  -> palm detector/landmark stage (camera/framing/light problem)
+      # Diagnostic: tells you WHERE the pipeline fails. Logged only on state
+      # change so it doesn't spam every sampled frame.
+      #   no landmarks  -> palm detector/landmark stage (camera/framing/light)
       #   landmarks but no gesture -> classifier problem (retraining would help)
       if not result.hand_landmarks:
-          logger.info("diag: no hand detected in frame")
+          diag = "no_hand"
       elif not result.gestures:
-          logger.info("diag: hand detected but no gesture classified")
+          diag = "no_gesture"
+      else:
+          diag = "ok"
+      if diag != _LAST_DIAG:
+          if diag == "no_hand":
+              logger.info("diag: no hand detected in frame")
+          elif diag == "no_gesture":
+              logger.info("diag: hand detected but no gesture classified")
+          else:
+              logger.info("diag: hand + gesture ok")
+          _LAST_DIAG = diag
 
       recognition_result_list.append(result)
       COUNTER += 1
