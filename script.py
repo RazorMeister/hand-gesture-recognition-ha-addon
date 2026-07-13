@@ -33,6 +33,10 @@ else:
         "roi_left": float(os.environ.get("ROI_LEFT", "0.0")),
         "roi_right": float(os.environ.get("ROI_RIGHT", "1.0")),
         "num_hands": int(os.environ.get("NUM_HANDS", "4")),
+        "min_hand_detection_confidence": float(os.environ.get("MIN_HAND_DETECTION_CONFIDENCE", "0.3")),
+        "min_hand_presence_confidence": float(os.environ.get("MIN_HAND_PRESENCE_CONFIDENCE", "0.5")),
+        "min_tracking_confidence": float(os.environ.get("MIN_TRACKING_CONFIDENCE", "0.5")),
+        "min_gesture_score": float(os.environ.get("MIN_GESTURE_SCORE", "0.5")),
     })
 
 
@@ -72,6 +76,10 @@ ROI_BOTTOM = float(data.get("roi_bottom", 1.0))
 ROI_LEFT = float(data.get("roi_left", 0.0))
 ROI_RIGHT = float(data.get("roi_right", 1.0))
 ROI_ENABLED = (ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT) != (0.0, 1.0, 0.0, 1.0)
+
+# Minimum gesture-classification score to publish. Lower = more sensitive
+# (fires on weaker gestures, but more false positives).
+MIN_GESTURE_SCORE = float(data.get("min_gesture_score", 0.5))
 
 # When False, the loop skips all heavy recognition work (palm detect + landmarks
 # + classify) but keeps the RTSP stream and MQTT connection alive. Defaults True
@@ -332,7 +340,7 @@ def run(model: str, num_hands: int,
               prev_handedness_value.pop(hand_index, None)
 
         # Publish only on change for this hand, above confidence threshold.
-        if hand_status != prev_handedness_value.get(hand_index) and score > 0.6:
+        if hand_status != prev_handedness_value.get(hand_index) and score > MIN_GESTURE_SCORE:
               client.publish(mqtt_topic, hand_status)
               logger.info("hand %d: %s (%.2f)", hand_index, hand_status, score)
               prev_handedness_value[hand_index] = hand_status
@@ -416,10 +424,12 @@ def main():
       default=480)
   args = parser.parse_args()
 
-  # Config option wins over the argparse default so HA users can set it.
+  # Config options win over argparse defaults so HA users can tune sensitivity.
   num_hands = int(data.get("num_hands", args.numHands))
-  run(args.model, num_hands, args.minHandDetectionConfidence,
-      args.minHandPresenceConfidence, args.minTrackingConfidence,
+  det_conf = float(data.get("min_hand_detection_confidence", args.minHandDetectionConfidence))
+  pres_conf = float(data.get("min_hand_presence_confidence", args.minHandPresenceConfidence))
+  track_conf = float(data.get("min_tracking_confidence", args.minTrackingConfidence))
+  run(args.model, num_hands, det_conf, pres_conf, track_conf,
       int(args.cameraId), args.frameWidth, args.frameHeight)
 
 
