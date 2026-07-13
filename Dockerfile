@@ -1,9 +1,10 @@
-# Use an official Python runtime as a parent image
-FROM python:3.9
+# Slim base -> smaller image, faster build + pull on the Pi.
+FROM python:3.9-slim
 
-# Install libgl1 to resolve libGL.so.1 dependency (libgl1-mesa-glx removed in Debian Trixie)
+# Runtime libs the wheels need on slim: libgl1/libglib2.0-0 for OpenCV,
+# libgomp1 (OpenMP) for MediaPipe/NumPy, ffmpeg for RTSP decoding.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 ffmpeg \
+    libgl1 libglib2.0-0 libgomp1 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 

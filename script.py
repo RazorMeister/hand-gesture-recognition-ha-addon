@@ -39,6 +39,7 @@ else:
         "min_gesture_score": float(os.environ.get("MIN_GESTURE_SCORE", "0.5")),
         "analyze_interval": float(os.environ.get("ANALYZE_INTERVAL", "0.4")),
         "enhance_contrast": os.environ.get("ENHANCE_CONTRAST", "false"),
+        "motion_threshold": float(os.environ.get("MOTION_THRESHOLD", "3.0")),
     })
 
 
@@ -87,6 +88,11 @@ MIN_GESTURE_SCORE = float(data.get("min_gesture_score", 0.5))
 # bright window on one side) where a hand in shadow has too little contrast for
 # the palm detector. Costs a little CPU per analysed frame.
 ENHANCE_CONTRAST = str(data.get("enhance_contrast", False)).lower() in ("true", "1", "yes", "on")
+
+# Motion gate: skip the (expensive) MediaPipe pipeline when the ROI is basically
+# static - nobody moving on the couch. Value = mean abs frame difference (0..255)
+# on a tiny greyscale image. 0 disables the gate (always analyse).
+MOTION_THRESHOLD = float(data.get("motion_threshold", 3.0))
 
 # When False, the loop skips all heavy recognition work (palm detect + landmarks
 # + classify) but keeps the RTSP stream and MQTT connection alive. Defaults True
@@ -240,6 +246,7 @@ def run(model: str, num_hands: int,
   # Continuously capture images from the camera and run inference
   clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if ENHANCE_CONTRAST else None
   last_analysis = 0.0  # wall-clock time of the last analysed frame
+  prev_gray = None     # previous tiny greyscale frame, for the motion gate
   while cap.isOpened():
     # HA toggled recognition off -> skip decode + heavy work, keep stream alive.
     if not analysis_enabled:
@@ -268,6 +275,15 @@ def run(model: str, num_hands: int,
         h, w = image.shape[:2]
         image = image[int(ROI_TOP * h):int(ROI_BOTTOM * h),
                       int(ROI_LEFT * w):int(ROI_RIGHT * w)]
+
+    # Motion gate: on a static scene, skip the whole MediaPipe pipeline. Cheap
+    # mean-abs-diff on a tiny greyscale frame; a hand moving easily clears it.
+    if MOTION_THRESHOLD > 0:
+        gray = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (160, 90))
+        motion = 999.0 if prev_gray is None else float(cv2.absdiff(gray, prev_gray).mean())
+        prev_gray = gray
+        if motion < MOTION_THRESHOLD:
+            continue
 
     # Optional contrast boost: apply CLAHE on the L (lightness) channel to pull
     # detail out of backlit/shadowed regions without wrecking colour.
