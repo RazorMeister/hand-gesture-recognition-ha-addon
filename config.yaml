@@ -1,5 +1,5 @@
 name: "Hand Gesture Recognition"
-version: "1.4.0"
+version: "1.4.1"
 image: "ghcr.io/razormeister/handgesturerecognition"
 slug: "hand-gesture-recognition"
 description: "Recognize hand gestures using MediaPipe and publish them to MQTT."
@@ -37,7 +37,6 @@ options:
   min_tracking_confidence: 0.5
   min_gesture_score: 0.5
   enhance_contrast: false
-  motion_threshold: 3.0
   web_ui: true
   web_port: 8099
   zones: 2
@@ -62,7 +61,6 @@ schema:
   min_tracking_confidence: float
   min_gesture_score: float
   enhance_contrast: bool
-  motion_threshold: float
   web_ui: bool
   web_port: int
   zones: int
