@@ -32,6 +32,7 @@ else:
         "roi_bottom": float(os.environ.get("ROI_BOTTOM", "1.0")),
         "roi_left": float(os.environ.get("ROI_LEFT", "0.0")),
         "roi_right": float(os.environ.get("ROI_RIGHT", "1.0")),
+        "num_hands": int(os.environ.get("NUM_HANDS", "4")),
     })
 
 
@@ -203,8 +204,11 @@ def run(model: str, num_hands: int,
   recognizer = vision.GestureRecognizer.create_from_options(options)
 
     
-  prev_handedness_value = None
-  hand_time= None
+  # Per-hand state, keyed by hand_index (MediaPipe gives no person identity,
+  # so hands are just slots 0..num_hands-1). Separate slots -> two hands don't
+  # clobber each other's dedup state.
+  prev_handedness_value = {}
+  hand_time = {}
 
   # Continuously capture images from the camera and run inference
   while cap.isOpened():
@@ -301,20 +305,26 @@ def run(model: str, num_hands: int,
                       label_text_color, label_thickness, cv2.LINE_AA)
           
           #print(result_text, (text_x, text_y))
-        #hand_status = (handedness_value+' '+category_name) #right/left + category name
         hand_status = category_name
 
-        if hand_time is not None:
-           time_difference = int(time.time() - hand_time)
-           if time_difference >= int(data.get("reset_hand_status_time")) :
-              prev_handedness_value = None
-        #print (hand_status+str(score))
-         # Check if the handedness status has changed
-        if hand_status != prev_handedness_value and score > 0.6:
+        # Option A: every detected hand publishes to one topic. Skip the
+        # "None"/no-gesture class so idle hands don't spam MQTT.
+        if hand_status in ("None", ""):
+            continue
+
+        # Per-hand dedup (keyed by hand_index). Reset this hand's memory after
+        # reset_hand_status_time seconds so the same gesture can fire again.
+        reset_after = int(data.get("reset_hand_status_time"))
+        if hand_index in hand_time and \
+           (time.time() - hand_time[hand_index]) >= reset_after:
+              prev_handedness_value.pop(hand_index, None)
+
+        # Publish only on change for this hand, above confidence threshold.
+        if hand_status != prev_handedness_value.get(hand_index) and score > 0.6:
               client.publish(mqtt_topic, hand_status)
-              logger.info(hand_status)
-              prev_handedness_value = hand_status
-              hand_time = time.time()
+              logger.info("hand %d: %s (%.2f)", hand_index, hand_status, score)
+              prev_handedness_value[hand_index] = hand_status
+              hand_time[hand_index] = time.time()
               
         # Draw hand landmarks on the frame
         hand_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
@@ -394,7 +404,9 @@ def main():
       default=480)
   args = parser.parse_args()
 
-  run(args.model, int(args.numHands), args.minHandDetectionConfidence,
+  # Config option wins over the argparse default so HA users can set it.
+  num_hands = int(data.get("num_hands", args.numHands))
+  run(args.model, num_hands, args.minHandDetectionConfidence,
       args.minHandPresenceConfidence, args.minTrackingConfidence,
       int(args.cameraId), args.frameWidth, args.frameHeight)
 
