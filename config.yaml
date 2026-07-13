@@ -18,7 +18,6 @@ docker:
 init: false
 arch:
   - aarch64
-  - amd64
 map:
   - config:rw
   - ssl

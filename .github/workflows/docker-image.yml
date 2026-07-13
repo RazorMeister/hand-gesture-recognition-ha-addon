@@ -5,16 +5,14 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Native arm64 runner -> no QEMU emulation. This is the big speedup.
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -26,12 +24,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push multi-arch image
+      - name: Build and push arm64 image
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # RPi 5 is arm64 only. No amd64 -> half the work, no emulation.
+          platforms: linux/arm64
           push: true
+          # Cache layers between runs so pip mediapipe/opencv isn't rebuilt cold.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ghcr.io/razormeister/handgesturerecognition:1.1.7
             ghcr.io/razormeister/handgesturerecognition:latest
