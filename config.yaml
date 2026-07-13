@@ -30,8 +30,9 @@ options:
   mqtt_username: razor
   mqtt_password: null
   mqtt_topic: "hand_gesture_status"
+  mqtt_enable_topic: "hand_gesture_enable"
   reset_hand_status_time: 10
-  
+
 schema:
   rtsp_url: str
   mqtt_host: str
@@ -39,4 +40,5 @@ schema:
   mqtt_username: str
   mqtt_password: password
   mqtt_topic: str
+  mqtt_enable_topic: str
   reset_hand_status_time: int

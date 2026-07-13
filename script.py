@@ -26,6 +26,7 @@ else:
         "mqtt_username": os.environ.get("MQTT_USERNAME", ""),
         "mqtt_password": os.environ.get("MQTT_PASSWORD", ""),
         "mqtt_topic": os.environ.get("MQTT_TOPIC", "hand_gesture_status"),
+        "mqtt_enable_topic": os.environ.get("MQTT_ENABLE_TOPIC", "hand_gesture_enable"),
         "reset_hand_status_time": int(os.environ.get("RESET_HAND_STATUS_TIME", "10")),
     })
 
@@ -55,14 +56,32 @@ mqtt_port = data.get("mqtt_port")
 mqtt_topic = data.get("mqtt_topic")
 mqtt_username = data.get("mqtt_username")
 mqtt_password = data.get("mqtt_password")
+# Topic HA publishes ON/OFF to, mirroring input_boolean.cfg_camera_gesture_recognition.
+mqtt_enable_topic = data.get("mqtt_enable_topic", "hand_gesture_enable")
 
+# When False, the loop skips all heavy recognition work (palm detect + landmarks
+# + classify) but keeps the RTSP stream and MQTT connection alive. Defaults True
+# so the addon still works if HA never publishes an enable state.
+analysis_enabled = True
 
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         logger.info("Connected to MQTT Broker")
+        client.subscribe(mqtt_enable_topic)
+        logger.info("Subscribed to enable topic: %s", mqtt_enable_topic)
     else:
-        logger.info("Connection to MQTT Broker failed with code", rc)
+        logger.info("Connection to MQTT Broker failed with code %s", rc)
+
+def on_message(client, userdata, msg):
+    global analysis_enabled
+    if msg.topic != mqtt_enable_topic:
+        return
+    payload = msg.payload.decode(errors="ignore").strip().lower()
+    analysis_enabled = payload in ("on", "1", "true", "enabled", "yes")
+    logger.info("Analysis %s (via %s=%s)",
+                "ENABLED" if analysis_enabled else "DISABLED",
+                mqtt_enable_topic, payload)
 
 # Initialize MQTT client
 client = mqtt.Client()
@@ -72,6 +91,7 @@ client.username_pw_set(username=mqtt_username, password=mqtt_password)
 
 # Assign callback functions
 client.on_connect = on_connect
+client.on_message = on_message
 
 
 # Connect to broker
@@ -87,6 +107,7 @@ client.loop_start()
 COUNTER, FPS = 0, 0
 START_TIME = time.time()
 FRAME_COUNT = 0  # Counter for saving images
+SAMPLE_EVERY = 10  # run recognition every Nth frame (lower = more responsive, more CPU)
 
 def run(model: str, num_hands: int,
         min_hand_detection_confidence: float,
@@ -146,6 +167,14 @@ def run(model: str, num_hands: int,
           FPS = fps_avg_frame_count / (time.time() - START_TIME)
           START_TIME = time.time()
 
+      # Diagnostic: tells you WHERE the pipeline fails.
+      #   no landmarks  -> palm detector/landmark stage (camera/framing/light problem)
+      #   landmarks but no gesture -> classifier problem (retraining would help)
+      if not result.hand_landmarks:
+          logger.info("diag: no hand detected in frame")
+      elif not result.gestures:
+          logger.info("diag: hand detected but no gesture classified")
+
       recognition_result_list.append(result)
       COUNTER += 1
 
@@ -175,21 +204,20 @@ def run(model: str, num_hands: int,
             # Increment the frame count
     FRAME_COUNT += 1
 
-   
+    # HA toggled recognition off -> skip heavy work, keep stream + MQTT alive.
+    if not analysis_enabled:
+        time.sleep(0.05)  # ease CPU while idle
+        continue
 
-        # Save an image every 1 second
-    if FRAME_COUNT % 25 == 0:
-            cv2.imwrite(f'frame.jpg', image)
-            #print(f'Image saved: frame_{FRAME_COUNT}.jpg')
+        # Run recognition every SAMPLE_EVERY frames.
+    if FRAME_COUNT % SAMPLE_EVERY == 0:
+            # Feed the frame straight from memory. The old code wrote it to
+            # frame.jpg and read it back -> JPEG compression + disk I/O = worse
+            # detection and slower. No round-trip now.
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
 
-            # Load the saved image for gesture recognition
-            saved_image = cv2.imread(f'frame.jpg')
-
-            # Perform gesture recognition on the saved image
-            rgb_saved_image = cv2.cvtColor(saved_image, cv2.COLOR_BGR2RGB)
-            mp_saved_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_saved_image)
-
-            recognizer.recognize_async(mp_saved_image, time.time_ns() // 1_000_000)
+            recognizer.recognize_async(mp_image, time.time_ns() // 1_000_000)
 
 
     # Show the FPS
@@ -313,7 +341,7 @@ def main():
       help='The minimum confidence score for hand detection to be considered '
            'successful.',
       required=False,
-      default=0.5)
+      default=0.3)
   parser.add_argument(
       '--minHandPresenceConfidence',
       help='The minimum confidence score of hand presence score in the hand '
