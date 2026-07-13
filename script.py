@@ -37,6 +37,7 @@ else:
         "min_hand_presence_confidence": float(os.environ.get("MIN_HAND_PRESENCE_CONFIDENCE", "0.5")),
         "min_tracking_confidence": float(os.environ.get("MIN_TRACKING_CONFIDENCE", "0.5")),
         "min_gesture_score": float(os.environ.get("MIN_GESTURE_SCORE", "0.5")),
+        "analyze_interval": float(os.environ.get("ANALYZE_INTERVAL", "0.4")),
     })
 
 
@@ -129,7 +130,7 @@ client.loop_start()
 COUNTER, FPS = 0, 0
 START_TIME = time.time()
 FRAME_COUNT = 0  # Counter for saving images
-SAMPLE_EVERY = 10  # run recognition every Nth frame (lower = more responsive, more CPU)
+ANALYZE_INTERVAL = float(data.get("analyze_interval", 0.4))  # seconds between analyses (lower = faster reaction, more CPU)
 _LAST_DIAG = None  # last diagnostic state, so we log only on change (no spam)
 
 def run(model: str, num_hands: int,
@@ -231,6 +232,7 @@ def run(model: str, num_hands: int,
   hand_time = {}
 
   # Continuously capture images from the camera and run inference
+  last_analysis = 0.0  # wall-clock time of the last analysed frame
   while cap.isOpened():
     # HA toggled recognition off -> skip decode + heavy work, keep stream alive.
     if not analysis_enabled:
@@ -238,16 +240,16 @@ def run(model: str, num_hands: int,
         time.sleep(0.05)    # ease CPU while idle
         continue
 
-    FRAME_COUNT += 1
-
-    # Only decode + analyse every SAMPLE_EVERY-th frame. grab() advances the
-    # RTSP stream cheaply (no H264 decode); we retrieve/decode ONLY the frames
-    # we actually use -> big CPU saving vs decoding all 25 fps.
-    if FRAME_COUNT % SAMPLE_EVERY != 0:
+    # Time-based sampling: analyse at most once per ANALYZE_INTERVAL seconds,
+    # independent of camera fps. grab() advances the RTSP stream cheaply
+    # (no H264 decode) between analysed frames -> big CPU saving.
+    now = time.time()
+    if now - last_analysis < ANALYZE_INTERVAL:
         cap.grab()
         continue
+    last_analysis = now
 
-    success, image = cap.read()   # grab + decode the sampled frame
+    success, image = cap.read()   # grab + decode the frame we analyse
     if not success:
       sys.exit(
           'ERROR: Unable to read from webcam. Please verify your webcam settings.'

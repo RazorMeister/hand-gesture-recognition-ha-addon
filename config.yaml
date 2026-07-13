@@ -1,5 +1,5 @@
 name: "Hand Gesture Recognition"
-version: "1.1.8"
+version: "1.1.9"
 image: "ghcr.io/razormeister/handgesturerecognition"
 slug: "hand-gesture-recognition"
 description: "Recognize hand gestures using MediaPipe and publish them to MQTT."
@@ -31,6 +31,7 @@ options:
   mqtt_topic: "hand_gesture_status"
   mqtt_enable_topic: "hand_gesture_enable"
   reset_hand_status_time: 10
+  analyze_interval: 0.4
   num_hands: 4
   min_hand_detection_confidence: 0.3
   min_hand_presence_confidence: 0.5
@@ -50,6 +51,7 @@ schema:
   mqtt_topic: str
   mqtt_enable_topic: str
   reset_hand_status_time: int
+  analyze_interval: float
   num_hands: int
   min_hand_detection_confidence: float
   min_hand_presence_confidence: float
